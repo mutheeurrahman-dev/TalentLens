@@ -1,0 +1,25 @@
+node_modules/
+frontend/node_modules/
+.env
+frontend/.env
+*.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.aws-sam/
+.pytest_cache/
+dist/
+build/
+*.log
+.DS_Store
+
+# Scratch and test runner artifacts
+test_*.png
+test_sections.*
+inspect_*.py
+check_word.py
+extract_zip.py
+convert_and_inspect_pdf.py
+rendered_pages/
+extracted_media/

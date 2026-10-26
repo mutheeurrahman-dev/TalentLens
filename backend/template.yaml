@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: TalentLens - Resume screening application with skill matching.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        BUCKET_NAME: !Ref ResumeBucket
+        TABLE_NAME: !Ref CandidatesTable
+
+Resources:
+  # ============================================================================
+  # SQS Queues
+  # ============================================================================
+  ProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: talentlens-processing-dlq
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: talentlens-processing-queue
+      VisibilityTimeout: 300 # Must be >= Lambda timeout (ProcessResumeFunction is 180s)
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessingDLQ.Arn
+        maxReceiveCount: 3
+
+  ProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3BucketToSendMessages
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt ProcessingQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::talentlens-resumes-${AWS::AccountId}-${AWS::Region}'
+
+  # ============================================================================
+  # S3 Bucket
+  # ============================================================================
+  ResumeBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: ProcessingQueuePolicy
+    Properties:
+      BucketName: !Sub 'talentlens-resumes-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3600
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt ProcessingQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: resumes/
+
+  # ============================================================================
+  # DynamoDB Table
+  # ============================================================================
+  CandidatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TalentLensCandidates
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: candidateId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: candidateId
+          KeyType: HASH
+
+  # ============================================================================
+  # API Gateway (HTTP API)
+  # ============================================================================
+  TalentLensApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        MaxAge: 300
+
+  # ============================================================================
+  # Lambda Functions
+  # ============================================================================
+  UploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: talentlens-upload
+      CodeUri: ./
+      Handler: handlers.upload.handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ResumeBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CandidatesTable
+      Events:
+        UploadApiGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TalentLensApi
+            Path: /api/upload
+            Method: GET
+        UploadApiPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TalentLensApi
+            Path: /api/upload
+            Method: POST
+
+  CandidatesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: talentlens-candidates
+      CodeUri: ./
+      Handler: handlers.candidates.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CandidatesTable
+      Events:
+        CandidatesApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TalentLensApi
+            Path: /api/candidates
+            Method: GET
+
+  MatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: talentlens-match
+      CodeUri: ./
+      Handler: handlers.match.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CandidatesTable
+      Events:
+        MatchApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TalentLensApi
+            Path: /api/match
+            Method: POST
+
+  ProcessResumeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: talentlens-process-resume
+      CodeUri: ./
+      Handler: handlers.process_resume.handler
+      Timeout: 180
+      MemorySize: 512
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ResumeBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CandidatesTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - textract:StartDocumentTextDetection
+                - textract:GetDocumentTextDetection
+              Resource: '*'
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProcessingQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+# ============================================================================
+# Stack Outputs
+# ============================================================================
+Outputs:
+  ApiUrl:
+    Description: HTTP API Gateway endpoint URL
+    Value: !Sub 'https://${TalentLensApi}.execute-api.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: TalentLensApiUrl
+
+  BucketName:
+    Description: S3 bucket for storing resumes
+    Value: !Ref ResumeBucket
+    Export:
+      Name: TalentLensBucketName
+
+  TableName:
+    Description: DynamoDB table name for candidate metadata
+    Value: !Ref CandidatesTable
+    Export:
+      Name: TalentLensTableName
+
+  QueueUrl:
+    Description: SQS processing queue URL
+    Value: !Ref ProcessingQueue
+    Export:
+      Name: TalentLensQueueUrl
